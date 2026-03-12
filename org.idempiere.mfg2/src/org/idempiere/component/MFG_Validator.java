@@ -90,8 +90,6 @@ public class MFG_Validator extends AbstractEventHandler {
 		registerTableEvent(IEventTopics.PO_AFTER_NEW, I_DD_OrderLine.Table_Name);
 		registerTableEvent(IEventTopics.PO_AFTER_NEW, I_PP_Order.Table_Name);
 		registerTableEvent(IEventTopics.PO_AFTER_NEW, I_PP_Order_BOMLine.Table_Name);
-		registerTableEvent(IEventTopics.PO_AFTER_NEW, I_C_Order.Table_Name);
-		registerTableEvent(IEventTopics.PO_AFTER_NEW, I_C_Order.Table_Name);
 		registerTableEvent(IEventTopics.PO_BEFORE_CHANGE, I_M_Product.Table_Name);
 		registerTableEvent(IEventTopics.PO_AFTER_CHANGE, I_C_Order.Table_Name);
 		registerTableEvent(IEventTopics.PO_AFTER_CHANGE, I_C_OrderLine.Table_Name);
@@ -103,8 +101,6 @@ public class MFG_Validator extends AbstractEventHandler {
 		registerTableEvent(IEventTopics.PO_AFTER_CHANGE, I_DD_OrderLine.Table_Name);
 		registerTableEvent(IEventTopics.PO_AFTER_CHANGE, I_PP_Order.Table_Name);
 		registerTableEvent(IEventTopics.PO_AFTER_CHANGE, I_PP_Order_BOMLine.Table_Name);
-		registerTableEvent(IEventTopics.PO_AFTER_CHANGE, I_M_Forecast.Table_Name);
-		registerTableEvent(IEventTopics.PO_AFTER_CHANGE, I_M_ForecastLine.Table_Name);
 		registerTableEvent(IEventTopics.PO_BEFORE_DELETE, I_C_Order.Table_Name);
 		registerTableEvent(IEventTopics.PO_BEFORE_DELETE, I_C_OrderLine.Table_Name);
 		registerTableEvent(IEventTopics.PO_BEFORE_DELETE, I_M_Requisition.Table_Name);
@@ -121,6 +117,8 @@ public class MFG_Validator extends AbstractEventHandler {
 		registerTableEvent(IEventTopics.DOC_BEFORE_COMPLETE, I_M_ForecastLine.Table_Name);
 		registerTableEvent(IEventTopics.DOC_AFTER_COMPLETE, I_M_Movement.Table_Name);
 		registerTableEvent(IEventTopics.DOC_AFTER_COMPLETE, I_M_InOut.Table_Name);
+		registerTableEvent(IEventTopics.DOC_BEFORE_REACTIVATE, I_C_Order.Table_Name);
+		registerTableEvent(IEventTopics.DOC_AFTER_REACTIVATE, I_C_Order.Table_Name);
 		log.info("MFG MODEL VALIDATOR IS NOW INITIALIZED"); }
 	@Override
 	protected void doHandleEvent(Event event) {
@@ -180,11 +178,64 @@ public class MFG_Validator extends AbstractEventHandler {
 			else if (po instanceof MOrder)
 			{
 				MOrder order = (MOrder)po;
-				// Compras: comportamiento original
-				if (isChange && !order.isSOTrx())
+				
+				// -------------------------------------------------------------
+				//  Limpieza de Workflows huérfanos al Reactivar la OC (vía Modelos)
+				// -------------------------------------------------------------
+				if (type.equals(IEventTopics.DOC_BEFORE_REACTIVATE) && !order.isSOTrx()) 
 				{
-					logEvent(event, po, type);
-					MPPMRP.C_Order(order);
+				    int tableId = MTable.getTable_ID(I_C_Order.Table_Name);
+				    int recordId = order.getC_Order_ID();
+				    
+				    // Buscar todos los procesos WF asociados a este documento que NO estén cerrados ni abortados
+				    String whereClause = "AD_Table_ID=? AND Record_ID=? AND WFState NOT IN (?,?)";
+				    java.util.List<org.compiere.wf.MWFProcess> wfProcesses = new Query(po.getCtx(), org.compiere.wf.MWFProcess.Table_Name, whereClause, trxName)
+				        .setParameters(new Object[]{tableId, recordId, org.compiere.wf.MWFProcess.WFSTATE_Completed, org.compiere.wf.MWFProcess.WFSTATE_Aborted})
+				        .list();
+				        
+				    for (org.compiere.wf.MWFProcess process : wfProcesses) {
+				        // Abortar el proceso
+				        process.setWFState(org.compiere.wf.MWFProcess.WFSTATE_Aborted);
+				        process.saveEx(trxName);
+				        
+				        // Buscar y cerrar las actividades hijas activas de este proceso
+				        String activityWhere = "AD_WF_Process_ID=? AND WFState NOT IN (?,?)";
+				        java.util.List<org.compiere.wf.MWFActivity> wfActivities = new Query(po.getCtx(), org.compiere.wf.MWFActivity.Table_Name, activityWhere, trxName)
+				            .setParameters(new Object[]{process.getAD_WF_Process_ID(), org.compiere.wf.MWFActivity.WFSTATE_Completed, org.compiere.wf.MWFActivity.WFSTATE_Aborted})
+				            .list();
+				            
+				        for (org.compiere.wf.MWFActivity activity : wfActivities) {
+				            // Se cierran/abortan para que no interfieran en la próxima ejecución
+				            activity.setWFState(org.compiere.wf.MWFActivity.WFSTATE_Aborted); 
+				            activity.saveEx(trxName);
+				        }
+				    }
+				    
+				    if (!wfProcesses.isEmpty()) {
+				        log.info("MFG_Validator - " + wfProcesses.size() + " Workflows colgados limpiados (abortados) para OC: " + order.getDocumentNo());
+				    }
+				}
+
+				
+				// -------------------------------------------------------------
+				//  Evitar que el cambio de Aprobación por Workflow dispare el MRP
+				// -------------------------------------------------------------
+				// Compras: comportamiento original (protegido)
+				else if (isChange && !order.isSOTrx())
+				{
+					// Si el cambio es SOLO porque el workflow seteó IsApproved=Y / DocStatus, no disparamos MRP.
+					// Esto evita el ciclo infinito de saveEx() dentro del propio Workflow.
+					boolean isOnlyWorkflowStatusChange = po.is_ValueChanged("IsApproved") || po.is_ValueChanged("DocStatus") || po.is_ValueChanged("DocAction");
+					boolean isRealMRPChange = po.is_ValueChanged(MOrder.COLUMNNAME_DateOrdered) || 
+					                          po.is_ValueChanged(MOrder.COLUMNNAME_DatePromised) ||
+					                          po.is_ValueChanged(MOrder.COLUMNNAME_M_Warehouse_ID);
+					
+					if (isOnlyWorkflowStatusChange && !isRealMRPChange) {
+						log.fine("MFG_Validator - Ignorando MRP para OC porque solo cambio el estado de Aprobación/Documento.");
+					} else {
+						logEvent(event, po, type);
+						MPPMRP.C_Order(order);
+					}
 				}
 				// Ventas
 				else if (type == IEventTopics.PO_AFTER_CHANGE && order.isSOTrx())
@@ -196,6 +247,7 @@ public class MFG_Validator extends AbstractEventHandler {
 					}
 				}
 			}
+
 			else if (po instanceof MOrderLine && isChange)
 			{
 				MOrderLine ol = (MOrderLine)po;
